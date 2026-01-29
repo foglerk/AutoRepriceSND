@@ -1,0 +1,559 @@
+--[=====[
+[[SND Metadata]]
+version: 2.0.1
+description: >-
+  Automated Marketboard Repricer (hardened):
+  Adds crash-safe wrappers + traceback logging so SND "Unknown error" becomes a real stacktrace in Dalamud logs.
+triggers:
+- onterritorychange
+[[End Metadata]]
+--]=====]
+
+------------------------------------------------------------
+-- CONFIGURATION
+------------------------------------------------------------
+local CONFIG = {
+  UNDERCUT_AMOUNT = 1,
+
+  TARGET_RETAINERS = { "Retainer1", "Retainer2" },
+  OWN_RETAINERS    = { "Retainer1", "Retainer2" },
+
+  DEBUG = false,
+
+  AUTO_MODE        = true,
+  AUTO_DEBOUNCE    = 3.0,
+  AUTO_BELL_SETTLE = 0.5,
+  AUTO_POST_DELAY  = 0.8,
+
+  FAST_READ = { maxWait = 5.0, refreshDelay = 5.0 },
+
+  OPEN_BELL = { maxAttempts = 50, targetInterval = 0.5, interactInterval = 1.0 },
+
+  NEW_LISTINGS = {
+    enabled = true,
+    maxPerRetainer = 20,
+    defaultMinStack = 1,
+    defaultPrice = 1000,
+    useDefaultWhenNoData = true,
+    postDelay = 0.25,
+    items = {
+      [12345] = { minStack = 10, defaultPrice = 50000, maxStacks = 2 },
+    },
+  },
+}
+
+------------------------------------------------------------
+-- CRASH-SAFE WRAPPERS + TRACEBACK (HARDENED)
+------------------------------------------------------------
+
+-- Safe numeric parsing: never throws, never uses invalid base
+local function safe_tonumber(v, base, fallback)
+  fallback = (fallback ~= nil) and fallback or 0
+  if v == nil then return fallback end
+
+  if type(v) == "number" then return v end
+
+  if type(v) == "string" then
+    v = v:gsub("[%s,]", "")
+  end
+
+  if base ~= nil then
+    if type(base) == "string" then base = base:match("%d+") end
+    base = tonumber(base)
+    if (not base) or base < 2 or base > 36 then
+      base = nil
+    end
+  end
+
+  local n = base and tonumber(v, base) or tonumber(v)
+  if n == nil then return fallback end
+  return n
+end
+
+local function TRACE(tag, err)
+  local tb = (debug and debug.traceback) and debug.traceback(tostring(err), 2) or tostring(err)
+  local msg = string.format("[Repricer][%s] %s\n%s", tostring(tag), tostring(err), tb)
+
+  -- Write full traceback to Dalamud log
+  if Dalamud and Dalamud.LogError then
+    Dalamud.LogError(msg)
+  elseif Dalamud and Dalamud.Log then
+    Dalamud.Log(msg)
+  end
+
+  -- Small in-game hint
+  yield("/echo [Repricer] Lua error - check Dalamud log for traceback.")
+end
+
+local function RUN_SAFE(fn, tag)
+  local ok, err = xpcall(fn, function(e) return e end)
+  if not ok then TRACE(tag or "RUN", err) end
+  return ok
+end
+
+local function countKeys(t)
+  if type(t) ~= "table" then return 0 end
+  local n = 0
+  for _ in pairs(t) do n = n + 1 end
+  return n
+end
+
+-- Hardened accessors for commonly-nil globals
+local function safeTargetName()
+  local ok, name = pcall(function()
+    return Entity and Entity.Target and Entity.Target.Name
+  end)
+  return ok and name or nil
+end
+
+local function safeCond(idx)
+  local ok, v = pcall(function()
+    return Svc and Svc.Condition and Svc.Condition[idx]
+  end)
+  return ok and v or false
+end
+
+local function autoRetainerBusy()
+  local ok, busy = pcall(function()
+    return IPC and IPC.AutoRetainer and IPC.AutoRetainer.IsBusy and IPC.AutoRetainer.IsBusy()
+  end)
+  return ok and busy or false
+end
+
+------------------------------------------------------------
+-- HELPER FUNCTIONS (Logging and Utility)
+------------------------------------------------------------
+local function logDebug(msg)
+  if CONFIG.DEBUG and Dalamud and Dalamud.Log then
+    Dalamud.Log("[Repricer DEBUG] " .. tostring(msg))
+  end
+end
+
+local function logEcho(msg)
+  yield("/echo [Repricer] " .. tostring(msg))
+end
+
+local function getAddon(name)
+  local ok, result = pcall(function() return Addons.GetAddon(name) end)
+  if ok then return result else return nil end
+end
+
+local function addonExists(name)
+  local a = getAddon(name)
+  return a and a.Exists or false
+end
+
+local function addonReady(name)
+  local a = getAddon(name)
+  return a and a.Ready or false
+end
+
+local function waitForAddon(name, timeoutSec)
+  local waited = 0
+  local interval = 0.05
+  while waited < timeoutSec do
+    if addonExists(name) and addonReady(name) then return true end
+    yield(string.format("/wait %.2f", interval))
+    waited = waited + interval
+  end
+  return addonExists(name) and addonReady(name)
+end
+
+local function getNodeText(addonName, path)
+  local addon = getAddon(addonName)
+  if not addon then return "" end
+  if type(path) ~= "table" then return "" end
+
+  local node = nil
+  local success = pcall(function()
+    node = addon:GetNode(table.unpack(path))
+  end)
+  if not success or node == nil then return "" end
+
+  local textProps = {"Text", "Value", "String", "Name", "Label"}
+  for _, prop in ipairs(textProps) do
+    local ok, val = pcall(function() return node[prop] end)
+    if ok and type(val) == "string" and val ~= "" then return val end
+  end
+
+  local textMethods = {"GetText", "AsString", "ToString"}
+  for _, method in ipairs(textMethods) do
+    local ok, func = pcall(function() return node[method] end)
+    if ok and type(func) == "function" then
+      local ok2, result = pcall(function() return func(node) end)
+      if ok2 and type(result) == "string" and result ~= "" then return result end
+    end
+  end
+  return ""
+end
+
+local function pcallAddon(addonName, update, p1, p2, p3, p4, p5)
+  if addonExists(addonName) and addonReady(addonName) then
+    local cmd = "/pcall " .. addonName .. " " .. tostring(update)
+    if p1 ~= nil then cmd = cmd .. " " .. p1 end
+    if p2 ~= nil then cmd = cmd .. " " .. p2 end
+    if p3 ~= nil then cmd = cmd .. " " .. p3 end
+    if p4 ~= nil then cmd = cmd .. " " .. p4 end
+    if p5 ~= nil then cmd = cmd .. " " .. p5 end
+    yield(cmd)
+  end
+end
+
+local function closeAddon(name, maxTries, waitInterval)
+  maxTries = maxTries or 50
+  waitInterval = waitInterval or 0.05
+  local tries = 0
+  while addonExists(name) and tries < maxTries do
+    pcallAddon(name, true, -1)
+    yield(string.format("/wait %.2f", waitInterval))
+    tries = tries + 1
+  end
+  return not addonExists(name)
+end
+
+------------------------------------------------------------
+-- UI NODE MAP
+------------------------------------------------------------
+local NodeMap = {
+  RetainerList = function(index)
+    local baseId = (index == 1) and 4 or (41000 + (index - 1))
+    return {1, 27, baseId, 2, 3}
+  end,
+  SellListCount = {1, 14, 19},
+  MarketBoardFirstPrice = {1, 26, 4, 5},
+  MarketBoardFirstSeller = {1, 26, 4, 10},
+  MarketBoardFooter = {26},
+}
+
+local function parseListingCount(text)
+  if not text or text == "" then return 0 end
+  local num = safe_tonumber(text:match("^(%d+)%s*/"), nil, 0)
+  return num
+end
+
+------------------------------------------------------------
+-- MARKET BOARD INTERACTIONS
+------------------------------------------------------------
+local function openComparePrices(slotIndex)
+  if not (addonExists("RetainerSellList") and addonReady("RetainerSellList")) then return false end
+  local listIndex0 = slotIndex - 1
+  pcallAddon("RetainerSellList", true, 0, listIndex0, 1)
+
+  if not waitForAddon("RetainerSell", 3.0) then
+    if addonExists("ContextMenu") then
+      pcallAddon("ContextMenu", true, 0, 0)
+      waitForAddon("RetainerSell", 5.0)
+    end
+  end
+
+  if not (addonExists("RetainerSell") and addonReady("RetainerSell")) then return false end
+  pcallAddon("RetainerSell", true, 4)
+  return waitForAddon("ItemSearchResult", 5.0)
+end
+
+local function readLowestMarketListing()
+  if not (addonExists("ItemSearchResult") and addonReady("ItemSearchResult")) then return nil, nil end
+  local startTime = os.clock()
+  local refreshed = false
+
+  while os.clock() - startTime < CONFIG.FAST_READ.maxWait do
+    local priceText = getNodeText("ItemSearchResult", NodeMap.MarketBoardFirstPrice)
+    if priceText and priceText ~= "" then
+      local digits = priceText:gsub("[^0-9]", "")
+      local price = safe_tonumber(digits, nil, 0)
+      if price > 0 then
+        local seller = getNodeText("ItemSearchResult", NodeMap.MarketBoardFirstSeller)
+        return price, seller
+      end
+    end
+
+    if not refreshed and (os.clock() - startTime) >= CONFIG.FAST_READ.refreshDelay then
+      refreshed = true
+      pcallAddon("RetainerSell", true, 4)
+    end
+    yield("/wait 0.1")
+  end
+
+  local footer = getNodeText("ItemSearchResult", NodeMap.MarketBoardFooter)
+  if footer and footer:find("No items found") then return nil, nil end
+  return nil, nil
+end
+
+local function decideNewPrice(lowestPrice, lowestSeller)
+  if not lowestPrice then return nil end
+  for _, name in ipairs(CONFIG.OWN_RETAINERS) do
+    if lowestSeller == name then return lowestPrice end
+  end
+  local newPrice = lowestPrice - CONFIG.UNDERCUT_AMOUNT
+  if newPrice < 1 then newPrice = 1 end
+  return newPrice
+end
+
+local function applyPrice(newPrice)
+  if not (addonExists("RetainerSell") and addonReady("RetainerSell")) then return false end
+  local currentText = getNodeText("RetainerSell", {1, 8, 10, 5})
+  local currentPrice = safe_tonumber((currentText or ""):gsub("[^0-9]", ""), nil, -1)
+  if currentPrice == -1 then
+    logEcho("Could not retrieve current price for item.")
+    return false
+  end
+  if not newPrice then
+    logEcho("No new price determined (skipping).")
+    return false
+  end
+  if newPrice == currentPrice then
+    logEcho(("Price already optimal: %d"):format(newPrice))
+    return true
+  end
+  logEcho(("Adjusting price: %d → %d"):format(currentPrice, newPrice))
+  pcallAddon("RetainerSell", true, 2, newPrice)
+  pcallAddon("RetainerSell", true, 0)
+  return true
+end
+
+local function closeItemWindows()
+  closeAddon("ItemSearchResult")
+  closeAddon("ItemHistory")
+  closeAddon("RetainerSell", 30)
+  if addonExists("ContextMenu") then pcallAddon("ContextMenu", true, -1) end
+end
+
+------------------------------------------------------------
+-- NEW LISTINGS (quota snapshot uses safe counter now)
+------------------------------------------------------------
+local currentStacks = {}
+
+local function buildCurrentStacks(retainerName)
+  currentStacks[retainerName] = {}
+  local inv = Inventory and Inventory.RetainerMarket
+  if not inv then
+    logDebug("Inventory.RetainerMarket unavailable; skipping quota snapshot.")
+    return
+  end
+
+  for i = 0, inv.Count - 1 do
+    local slot = inv[i]
+    local id = safe_tonumber(slot and slot.ItemId, nil, 0)
+    if id and id > 0 then
+      currentStacks[retainerName][id] = (currentStacks[retainerName][id] or 0) + 1
+    end
+  end
+
+  logDebug(("Built current stack list for %s (unique items=%d)"):format(
+    retainerName, countKeys(currentStacks[retainerName])
+  ))
+end
+
+local function canListMore(retainerName, itemId)
+  local cfg = (CONFIG.NEW_LISTINGS.items and CONFIG.NEW_LISTINGS.items[itemId]) or {}
+
+  local maxTotal = safe_tonumber(cfg.maxStacks, nil, math.huge)
+  if maxTotal <= 0 then maxTotal = math.huge end
+
+  local perRet = cfg.perRetainer or {}
+  local maxForRetainer = safe_tonumber(perRet[retainerName], nil, maxTotal)
+  if maxForRetainer <= 0 then maxForRetainer = maxTotal end
+
+  local already = (currentStacks[retainerName] and currentStacks[retainerName][itemId]) or 0
+  return already < maxForRetainer
+end
+
+------------------------------------------------------------
+-- RETAINER LIST / MAIN LOOP (auto guards now)
+------------------------------------------------------------
+local function ensureRetainerListOpen()
+  if addonExists("RetainerList") and addonReady("RetainerList") then return true end
+  logEcho("Opening Summoning Bell...")
+
+  local attempts = 0
+  while attempts < CONFIG.OPEN_BELL.maxAttempts do
+    yield("/target Summoning Bell")
+    yield(string.format("/wait %.2f", CONFIG.OPEN_BELL.targetInterval))
+    yield("/pinteract")
+    yield(string.format("/wait %.2f", CONFIG.OPEN_BELL.interactInterval))
+    if addonExists("RetainerList") and addonReady("RetainerList") then
+      logEcho("Retainer List opened.")
+      return true
+    end
+    attempts = attempts + 1
+  end
+
+  logEcho("Failed to open Retainer List. Stand closer to the Summoning Bell.")
+  return false
+end
+
+local function getRetainerListNames()
+  local names = {}
+  if not (addonExists("RetainerList") and addonReady("RetainerList")) then return names end
+  for slot = 1, 12 do
+    local name = getNodeText("RetainerList", NodeMap.RetainerList(slot))
+    if name and name ~= "" then
+      table.insert(names, { index = slot, name = name })
+    end
+  end
+  return names
+end
+
+local function openRetainerByIndex(index)
+  pcallAddon("RetainerList", true, 2, index - 1)
+  if not waitForAddon("SelectString", 8.0) then return false end
+  pcallAddon("SelectString", true, 2)
+  return waitForAddon("RetainerSellList", 10.0)
+end
+
+local function closeRetainerAndBackList()
+  closeAddon("RetainerSellList")
+  closeAddon("SelectString")
+  waitForAddon("RetainerList", 5.0)
+end
+
+local function repriceAllListings(retainerName)
+  if not (addonExists("RetainerSellList") and addonReady("RetainerSellList")) then return end
+
+  local total = parseListingCount(getNodeText("RetainerSellList", NodeMap.SellListCount))
+  if total <= 0 then
+    logEcho(retainerName .. " has no market listings.")
+    return
+  end
+
+  logEcho(("Repricing %d items for %s..."):format(total, retainerName))
+  for slot = 1, total do
+    logEcho(("Item %d/%d (%s)"):format(slot, total, retainerName))
+
+    local ok = RUN_SAFE(function()
+      if not openComparePrices(slot) then
+        logEcho("  - Failed to open compare prices; skipping.")
+        closeItemWindows()
+        return
+      end
+
+      local low, seller = readLowestMarketListing()
+      closeAddon("ItemSearchResult"); closeAddon("ItemHistory")
+
+      if low then
+        local want = decideNewPrice(low, seller)
+        applyPrice(want)
+      else
+        logEcho("  - No market data (timeout/no listings).")
+      end
+
+      closeAddon("RetainerSell")
+    end, ("RepriceSlot_%d"):format(slot))
+
+    if not ok then
+      -- If a slot crashed, try to recover UI and keep going
+      closeItemWindows()
+    end
+
+    yield("/wait 0.2")
+  end
+end
+
+local function processRetainer(retainerName)
+  buildCurrentStacks(retainerName)
+  repriceAllListings(retainerName)
+
+  -- If you have the rest of NEW_LISTINGS functions, keep them here.
+  -- (I didn’t paste the full new-listing portion again to keep this patch focused on your crash.)
+end
+
+local function runRepricingCycle()
+  if not ensureRetainerListOpen() then return end
+
+  local retainers = getRetainerListNames()
+  if #retainers == 0 then
+    logEcho("No retainers found.")
+    closeAddon("RetainerList")
+    return
+  end
+
+  local targets = {}
+  if #CONFIG.TARGET_RETAINERS > 0 then
+    for _, entry in ipairs(retainers) do
+      for _, want in ipairs(CONFIG.TARGET_RETAINERS) do
+        if entry.name == want then table.insert(targets, entry) end
+      end
+    end
+  else
+    targets = retainers
+  end
+
+  if #targets == 0 then
+    logEcho("No retainers matched TARGET_RETAINERS.")
+    closeAddon("RetainerList")
+    return
+  end
+
+  logEcho(("Starting repricing for %d retainer(s)..."):format(#targets))
+  for i, ret in ipairs(targets) do
+    logEcho(("[%d/%d] %s"):format(i, #targets, ret.name))
+    RUN_SAFE(function()
+      if openRetainerByIndex(ret.index) then
+        processRetainer(ret.name)
+      else
+        logEcho("Could not open retainer: " .. ret.name)
+      end
+      closeRetainerAndBackList()
+    end, "ProcessRetainer_" .. tostring(ret.name))
+
+    yield("/wait 0.5")
+  end
+
+  closeAddon("RetainerList")
+  logEcho("Repricing cycle completed.")
+end
+
+------------------------------------------------------------
+-- AUTO LOOP (hardened)
+------------------------------------------------------------
+local autoLastRunTime = 0
+local autoInProgress = false
+local bellTargetTime = 0
+
+logEcho("Repricer loaded (with traceback logging).")
+
+while true do
+  if not CONFIG.AUTO_MODE then break end
+
+  local atBell = safeCond(50) and (safeTargetName() == "Summoning Bell")
+
+  if atBell then
+    if bellTargetTime == 0 then bellTargetTime = os.clock() end
+
+    local debounced = (os.clock() - autoLastRunTime) >= CONFIG.AUTO_DEBOUNCE
+    local settled   = (os.clock() - bellTargetTime) >= CONFIG.AUTO_BELL_SETTLE
+
+    if settled and debounced and not autoInProgress then
+      autoInProgress = true
+      logEcho("Summoning Bell detected - starting auto repricing...")
+
+      -- AutoRetainer wait (guarded)
+      local waited = 0
+      local maxWait = 60
+      while waited < maxWait and autoRetainerBusy() do
+        yield("/wait 0.5")
+        waited = waited + 0.5
+      end
+      if autoRetainerBusy() then
+        logEcho("AutoRetainer still busy; skipping this round.")
+      else
+        RUN_SAFE(function()
+          runRepricingCycle()
+        end, "RepriceCycle")
+        autoLastRunTime = os.clock()
+        logEcho("Auto repricing run finished.")
+        yield(string.format("/wait %.2f", CONFIG.AUTO_POST_DELAY))
+      end
+
+      autoInProgress = false
+
+      -- Wait until not targeting bell to avoid immediate retrigger
+      repeat yield("/wait 0.2") until safeTargetName() ~= "Summoning Bell"
+      bellTargetTime = 0
+    end
+  else
+    bellTargetTime = 0
+  end
+
+  yield("/wait 0.5")
+end
